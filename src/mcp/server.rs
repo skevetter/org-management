@@ -59,7 +59,7 @@ impl OrgMcpServer {
         let actor = self.resolve_actor(params.actor);
 
         let db = self.db.lock().unwrap();
-        let agent = db
+        let result = db
             .register_agent(
                 &params.name,
                 &params.agent_type,
@@ -67,11 +67,19 @@ impl OrgMcpServer {
                 ns,
                 params.metadata.as_deref(),
                 actor.as_deref(),
+                params.status.as_deref(),
+                params.room.as_deref(),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let action = if result.created { "created" } else { "updated" };
+        let mut val = serde_json::to_value(&result.agent).unwrap();
+        val.as_object_mut()
+            .unwrap()
+            .insert("action".to_string(), serde_json::json!(action));
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&agent).unwrap(),
+            serde_json::to_string(&val).unwrap(),
         )]))
     }
 
@@ -80,15 +88,58 @@ impl OrgMcpServer {
         &self,
         Parameters(params): Parameters<DeregisterAgentParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        use crate::models::DeregisterResult;
+
         let ns = self.resolve_namespace(&params.namespace);
         let actor = self.resolve_actor(params.actor);
+        let cascade = params.cascade.unwrap_or(false);
 
         let db = self.db.lock().unwrap();
-        db.deregister_agent(&params.id, ns, actor.as_deref())
+        let result = db
+            .deregister_agent(&params.id, ns, actor.as_deref(), cascade)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        match result {
+            DeregisterResult::HasChildren(children) => {
+                let child_list: Vec<_> = children
+                    .iter()
+                    .map(|c| serde_json::json!({"id": c.id, "name": c.name}))
+                    .collect();
+                Err(ErrorData::invalid_params(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "has_children",
+                        "children": child_list
+                    }))
+                    .unwrap(),
+                    None,
+                ))
+            }
+            DeregisterResult::Cascaded(count) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({"deregistered": count, "cascade": true}))
+                    .unwrap(),
+            )])),
+            DeregisterResult::Deleted => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({"deregistered": params.id})).unwrap(),
+            )])),
+        }
+    }
+
+    #[tool(
+        description = "Update an agent's status (active, inactive, archived, running, idle, blocked, done)"
+    )]
+    fn update_agent_status(
+        &self,
+        Parameters(params): Parameters<UpdateAgentStatusParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let agent = db
+            .update_agent_status(&params.agent_id, &params.status, ns)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&serde_json::json!({"deregistered": params.id})).unwrap(),
+            serde_json::to_string(&agent).unwrap(),
         )]))
     }
 
@@ -128,7 +179,7 @@ impl OrgMcpServer {
 
         let db = self.db.lock().unwrap();
         let result = db
-            .list_children(&params.id, ns, limit, offset)
+            .list_children(&params.id, ns, limit, offset, params.status.as_deref())
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -252,6 +303,32 @@ impl OrgMcpServer {
         )]))
     }
 
+    #[tool(description = "List agents with optional filters for status, parent name, and role")]
+    fn list_agents(
+        &self,
+        Parameters(params): Parameters<ListAgentsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+        let limit = params.limit.unwrap_or(100);
+        let offset = params.offset.unwrap_or(0);
+
+        let db = self.db.lock().unwrap();
+        let result = db
+            .list_agents(
+                ns,
+                params.status.as_deref(),
+                params.parent.as_deref(),
+                params.role.as_deref(),
+                limit,
+                offset,
+            )
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap(),
+        )]))
+    }
+
     #[tool(description = "Search the agent directory using FTS5 full-text search")]
     fn search_directory(
         &self,
@@ -270,6 +347,66 @@ impl OrgMcpServer {
                 &serde_json::json!({"results": result.agents, "total": result.total}),
             )
             .unwrap(),
+        )]))
+    }
+
+    #[tool(
+        description = "Bulk deregister all agents in a namespace (org-id). Without cascade, only removes leaf agents. With cascade, removes all agents and artifacts."
+    )]
+    fn bulk_deregister_agents(
+        &self,
+        Parameters(params): Parameters<BulkDeregisterParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cascade = params.cascade.unwrap_or(false);
+
+        let db = self.db.lock().unwrap();
+        let (agents_count, artifacts_count) = db
+            .bulk_deregister(&params.org_id, cascade)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&serde_json::json!({
+                "agents_deregistered": agents_count,
+                "artifacts_deregistered": artifacts_count
+            }))
+            .unwrap(),
+        )]))
+    }
+
+    #[tool(description = "Update an agent's last_seen_at timestamp (heartbeat)")]
+    fn agent_heartbeat(
+        &self,
+        Parameters(params): Parameters<AgentHeartbeatParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let agent = db
+            .agent_heartbeat(&params.agent_id, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&agent).unwrap(),
+        )]))
+    }
+
+    #[tool(
+        description = "List stale agents (running status, no recent heartbeat within threshold minutes)"
+    )]
+    fn list_stale_agents(
+        &self,
+        Parameters(params): Parameters<ListStaleAgentsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+        let threshold = params.threshold_minutes.unwrap_or(30);
+
+        let db = self.db.lock().unwrap();
+        let result = db
+            .list_stale_agents(ns, threshold)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap(),
         )]))
     }
 }

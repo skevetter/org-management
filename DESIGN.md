@@ -393,4 +393,144 @@ schemars = "1"
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"
+
+## v0.2.0
+
+### Schema Changes (v1 → v2 Migration)
+
+The `agents` table gains two new nullable columns. On `db.rs::open()`, a migration function (`migrate_v1_to_v2`) runs `ALTER TABLE agents ADD COLUMN` for each missing column — making the upgrade non-destructive for existing databases.
+
+```sql
+-- Added to agents table
+room          TEXT,                  -- chat room slug associated with agent
+last_seen_at  TEXT                   -- ISO8601 timestamp of last heartbeat
+```
+
+**Migration logic:** `migrate_v1_to_v2` queries `pragma_table_info('agents')` and issues `ALTER TABLE ... ADD COLUMN` only when the column is absent. Safe to run on any schema version.
+
+### New CLI Commands
+
+#### `update-status` — Update agent status
+
+```
+org-management update-status --id <id> --status <status> [options]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--id <id>` | yes | Agent ID (supports short prefix) |
+| `--status <status>` | yes | New status: running, idle, blocked, done, active, inactive, archived |
+| `--namespace <ns>` | no | Namespace scope |
+| `--actor <id>` | no | Who performed this action |
+| `--json` | no | Structured JSON output |
+
+**Behavior:** Sets `status` and `updated_at`. Emits updated `Agent` record.
+
+#### `list` — Flat agent list with filters
+
+```
+org-management list [options]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--status <s>` | no | Filter by status |
+| `--parent <name>` | no | Filter by parent agent name |
+| `--role <role>` | no | Filter by agent_type |
+| `--namespace <ns>` | no | Namespace scope |
+| `--limit <n>` | no | Max results (default: 50) |
+| `--offset <n>` | no | Pagination offset (default: 0) |
+| `--json` | no | Structured JSON output |
+
+**Behavior:** Returns all agents in namespace matching optional filters. Each row includes id, name, type, status, parent name, room, and last_seen_at.
+
+#### `bulk-deregister` — Remove all agents in a namespace
+
+```
+org-management bulk-deregister --org-id <org-id> [--cascade] [options]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--org-id <org-id>` | yes | Namespace to clear |
+| `--cascade` | no | Also deregister agents that have children |
+| `--json` | no | Structured JSON output |
+
+**Behavior:** Archives all agents in the given namespace. Without `--cascade`, rejects if any agent has children. With `--cascade`, removes entire subtrees.
+
+#### `heartbeat` — Update agent last_seen_at
+
+```
+org-management heartbeat --id <id> [options]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--id <id>` | yes | Agent ID (supports short prefix) |
+| `--namespace <ns>` | no | Namespace scope |
+| `--json` | no | Structured JSON output |
+
+**Behavior:** Sets `last_seen_at` to current UTC timestamp. Used by agents to signal liveness.
+
+#### `stale` — List running agents without recent heartbeat
+
+```
+org-management stale [--threshold <minutes>] [options]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--threshold <minutes>` | no | Minutes since last heartbeat (default: 30) |
+| `--namespace <ns>` | no | Namespace scope |
+| `--json` | no | Structured JSON output |
+
+**Behavior:** Returns agents with `status = 'running'` and `last_seen_at` older than threshold (or NULL). Used for detecting orphaned/stalled agents.
+
+### Modified CLI Commands
+
+#### `register` — Changes
+
+Added `--status` and `--room` flags:
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--status <status>` | no | Initial status (default: active) |
+| `--room <slug>` | no | Chat room slug associated with agent |
+
+**Output change:** Now emits `CREATED` or `UPDATED` prefix on text output and adds `"action": "created" | "updated"` to JSON output. Fixes the silent-upsert problem where callers could not tell whether a new agent was created or an existing one was updated.
+
+#### `deregister` — Changes
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--cascade` | no | Also remove all descendant agents (full subtree) |
+
+**Behavior change (BUG-1 fix):** Without `--cascade`, `deregister` now rejects with exit code 1 if the target agent has any children. Before this fix, deregistering a parent silently left children with a dangling parent reference. With `--cascade`, the full subtree is recursively deregistered.
+
+### New MCP Tools
+
+| Tool | Params | Returns |
+|------|--------|---------|
+| `update_agent_status` | agent_id\*, status\*, namespace | `Agent` |
+| `list_agents` | namespace, status, parent, role, limit (50), offset (0) | `{ agents: [Agent], total }` |
+| `bulk_deregister_agents` | org_id\*, cascade (false) | `{ deregistered: [id] }` |
+| `agent_heartbeat` | agent_id\*, namespace | `Agent` |
+| `list_stale_agents` | threshold_minutes (30), namespace | `{ agents: [Agent], total }` |
+
+\* = required. Defaults shown in parentheses.
+
+### Modified MCP Tools
+
+| Tool | Change |
+|------|--------|
+| `register_agent` | Added `status`, `room` params. Response includes `"action": "created" \| "updated"`. |
+| `deregister_agent` | Added `cascade` param (default false). Returns error if agent has children and cascade is false. |
+| `list_children` | Added optional `status` filter param. |
+
+### Bug Fixes
+
+| Bug | Description | Fix |
+|-----|-------------|-----|
+| **BUG-1** | `deregister` silently orphaned child agents when a parent was removed | `deregister` now exits 1 with an error if children exist; `--cascade` flag removes the full subtree cleanly |
+| **BUG-2** | `register` silently upserted without indicating whether the agent was new or existing | `register` now outputs `CREATED` or `UPDATED` in text mode and `"action"` field in JSON mode |
 ```

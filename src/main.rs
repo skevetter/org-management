@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use db::Database;
 use mcp::server::OrgMcpServer;
-use models::{AgentType, ArtifactStatus, ArtifactType, TreeNode};
+use models::{AgentStatus, AgentType, ArtifactStatus, ArtifactType, DeregisterResult, TreeNode};
 
 fn default_db_path() -> PathBuf {
     let base = match std::env::var("XDG_DATA_HOME") {
@@ -69,10 +69,16 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long)]
         actor: Option<String>,
+        #[arg(long, value_enum)]
+        status: Option<AgentStatus>,
+        #[arg(long)]
+        room: Option<String>,
     },
     Deregister {
         #[arg(long)]
         id: String,
+        #[arg(long)]
+        cascade: bool,
         #[arg(long)]
         actor: Option<String>,
     },
@@ -89,6 +95,14 @@ enum Commands {
         limit: i64,
         #[arg(long, default_value_t = 0)]
         offset: i64,
+        #[arg(long, value_enum)]
+        status: Option<AgentStatus>,
+    },
+    UpdateStatus {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum)]
+        status: AgentStatus,
     },
     Ancestors {
         #[arg(long)]
@@ -102,9 +116,35 @@ enum Commands {
         #[command(subcommand)]
         command: ArtifactCommands,
     },
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        #[arg(long, default_value_t = 0)]
+        offset: i64,
+    },
     Serve {
         #[arg(long, default_value = "stdio")]
         transport: String,
+    },
+    BulkDeregister {
+        #[arg(long)]
+        org_id: String,
+        #[arg(long)]
+        cascade: bool,
+    },
+    Heartbeat {
+        #[arg(long)]
+        id: String,
+    },
+    Stale {
+        #[arg(long, default_value_t = 30)]
+        threshold: i64,
     },
 }
 
@@ -189,9 +229,12 @@ fn main() {
             parent,
             metadata,
             actor,
+            status,
+            room,
         } => {
             let actor = get_actor(actor.as_deref());
-            let agent = db
+            let status_str = status.map(|s| s.to_string());
+            let result = db
                 .register_agent(
                     &name,
                     &agent_type.to_string(),
@@ -199,31 +242,82 @@ fn main() {
                     namespace,
                     metadata.as_deref(),
                     actor.as_deref(),
+                    status_str.as_deref(),
+                    room.as_deref(),
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to register agent: {e}");
                     std::process::exit(1);
                 });
+            let action = if result.created { "created" } else { "updated" };
             if json {
-                println!("{}", serde_json::to_string(&agent).unwrap());
+                let mut val = serde_json::to_value(&result.agent).unwrap();
+                val.as_object_mut()
+                    .unwrap()
+                    .insert("action".to_string(), serde_json::json!(action));
+                println!("{}", serde_json::to_string(&val).unwrap());
             } else {
-                println!("{agent}");
+                let label = if result.created { "CREATED" } else { "UPDATED" };
+                println!("{label} {}", result.agent.name);
+                println!("{}", result.agent);
             }
         }
-        Commands::Deregister { id, actor } => {
+        Commands::Deregister { id, cascade, actor } => {
             let actor = get_actor(actor.as_deref());
-            db.deregister_agent(&id, namespace, actor.as_deref())
+            let result = db
+                .deregister_agent(&id, namespace, actor.as_deref(), cascade)
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to deregister agent: {e}");
                     std::process::exit(1);
                 });
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({"deregistered": id})).unwrap()
-                );
-            } else {
-                println!("Agent {id} deregistered.");
+            match result {
+                DeregisterResult::HasChildren(children) => {
+                    if json {
+                        let child_list: Vec<_> = children
+                            .iter()
+                            .map(|c| serde_json::json!({"id": c.id, "name": c.name}))
+                            .collect();
+                        eprintln!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "error": "has_children",
+                                "children": child_list
+                            }))
+                            .unwrap()
+                        );
+                    } else {
+                        eprintln!(
+                            "Cannot deregister {}: has {} children. Use --cascade to delete subtree.",
+                            id,
+                            children.len()
+                        );
+                    }
+                    std::process::exit(1);
+                }
+                DeregisterResult::Cascaded(count) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(
+                                &serde_json::json!({"deregistered": count, "cascade": true})
+                            )
+                            .unwrap()
+                        );
+                    } else {
+                        println!("Deregistered {count} agents (cascade).");
+                    }
+                }
+                DeregisterResult::Deleted => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({"deregistered": id}))
+                                .unwrap()
+                        );
+                    } else {
+                        println!("Agent {id} deregistered.");
+                    }
+                }
             }
         }
         Commands::Lookup { id, name } => {
@@ -251,9 +345,15 @@ fn main() {
                 }
             }
         }
-        Commands::Children { id, limit, offset } => {
+        Commands::Children {
+            id,
+            limit,
+            offset,
+            status,
+        } => {
+            let status_str = status.map(|s| s.to_string());
             let result = db
-                .list_children(&id, namespace, limit, offset)
+                .list_children(&id, namespace, limit, offset, status_str.as_deref())
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to list children: {e}");
                     std::process::exit(1);
@@ -269,6 +369,19 @@ fn main() {
                     println!("{:<38} {:<20} {:<12}", a.id, a.name, a.agent_type);
                 }
                 println!("\n{} agent(s) total", result.total);
+            }
+        }
+        Commands::UpdateStatus { id, status } => {
+            let agent = db
+                .update_agent_status(&id, &status.to_string(), namespace)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to update agent status: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&agent).unwrap());
+            } else {
+                println!("{agent}");
             }
         }
         Commands::Ancestors { id } => {
@@ -403,6 +516,47 @@ fn main() {
                 }
             }
         },
+        Commands::List {
+            status,
+            parent,
+            role,
+            limit,
+            offset,
+        } => {
+            let result = db
+                .list_agents(
+                    namespace,
+                    status.as_deref(),
+                    parent.as_deref(),
+                    role.as_deref(),
+                    limit,
+                    offset,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to list agents: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.agents.is_empty() {
+                println!("No agents found.");
+            } else {
+                println!(
+                    "{:<20} {:<16} {:<10} {:<20} {:<20} {:<20}",
+                    "NAME", "ROLE", "STATUS", "PARENT", "ROOM", "REGISTERED"
+                );
+                println!("{}", "-".repeat(106));
+                for a in &result.agents {
+                    let parent_name = a.parent_agent_id.as_deref().unwrap_or("-");
+                    let room = a.room.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<20} {:<16} {:<10} {:<20} {:<20} {:<20}",
+                        a.name, a.agent_type, a.status, parent_name, room, a.created_at
+                    );
+                }
+                println!("\n{} agent(s) total", result.total);
+            }
+        }
         Commands::Serve { transport } => {
             if transport != "stdio" {
                 eprintln!("Only stdio transport is supported");
@@ -421,6 +575,65 @@ fn main() {
                 let service = server.serve(transport).await.unwrap();
                 service.waiting().await.unwrap();
             });
+        }
+        Commands::BulkDeregister { org_id, cascade } => {
+            let (agents_count, artifacts_count) =
+                db.bulk_deregister(&org_id, cascade).unwrap_or_else(|e| {
+                    eprintln!("Failed to bulk deregister: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "agents_deregistered": agents_count,
+                        "artifacts_deregistered": artifacts_count
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "Bulk deregistered {agents_count} agent(s) and {artifacts_count} artifact(s) from namespace '{org_id}'."
+                );
+            }
+        }
+        Commands::Heartbeat { id } => {
+            let agent = db.agent_heartbeat(&id, namespace).unwrap_or_else(|e| {
+                eprintln!("Failed to heartbeat agent: {e}");
+                std::process::exit(1);
+            });
+            if json {
+                println!("{}", serde_json::to_string(&agent).unwrap());
+            } else {
+                println!("{agent}");
+            }
+        }
+        Commands::Stale { threshold } => {
+            let result = db
+                .list_stale_agents(namespace, threshold)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to list stale agents: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.agents.is_empty() {
+                println!("No stale agents found.");
+            } else {
+                println!(
+                    "{:<38} {:<20} {:<12} {:<24}",
+                    "ID", "NAME", "TYPE", "LAST SEEN"
+                );
+                println!("{}", "-".repeat(94));
+                for a in &result.agents {
+                    let last_seen = a.last_seen_at.as_deref().unwrap_or("never");
+                    println!(
+                        "{:<38} {:<20} {:<12} {:<24}",
+                        a.id, a.name, a.agent_type, last_seen
+                    );
+                }
+                println!("\n{} stale agent(s)", result.total);
+            }
         }
     }
 }
