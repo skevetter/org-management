@@ -874,13 +874,14 @@ fn test_short_id_prefix() {
 }
 
 #[test]
-fn test_serve_prints_stub() {
+fn test_serve_starts_and_exits_on_closed_stdin() {
     let (_dir, db) = setup();
     cmd(&db)
         .args(["serve"])
+        .write_stdin("")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("MCP server not yet implemented"));
+        .failure()
+        .stderr(predicate::str::contains("ConnectionClosed"));
 }
 
 #[test]
