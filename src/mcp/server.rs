@@ -350,7 +350,9 @@ impl OrgMcpServer {
         )]))
     }
 
-    #[tool(description = "Bulk deregister all agents in a namespace (org-id). Without cascade, only removes leaf agents. With cascade, removes all agents and artifacts.")]
+    #[tool(
+        description = "Bulk deregister all agents in a namespace (org-id). Without cascade, only removes leaf agents. With cascade, removes all agents and artifacts."
+    )]
     fn bulk_deregister_agents(
         &self,
         Parameters(params): Parameters<BulkDeregisterParams>,
@@ -388,7 +390,9 @@ impl OrgMcpServer {
         )]))
     }
 
-    #[tool(description = "List stale agents (running status, no recent heartbeat within threshold minutes)")]
+    #[tool(
+        description = "List stale agents (running status, no recent heartbeat within threshold minutes)"
+    )]
     fn list_stale_agents(
         &self,
         Parameters(params): Parameters<ListStaleAgentsParams>,
