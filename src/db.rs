@@ -648,6 +648,110 @@ impl Database {
         Ok(AgentListResult { agents, total })
     }
 
+    pub fn list_agents(
+        &self,
+        namespace: &str,
+        status_filter: Option<&str>,
+        parent_name_filter: Option<&str>,
+        role_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<AgentListResult> {
+        let parent_id = if let Some(parent_name) = parent_name_filter {
+            let id: String = self
+                .conn
+                .query_row(
+                    "SELECT id FROM agents WHERE name = ?1 AND namespace = ?2",
+                    params![parent_name, namespace],
+                    |row| row.get(0),
+                )
+                .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            Some(id)
+        } else {
+            None
+        };
+
+        let mut conditions = vec!["a.namespace = ?1".to_string()];
+        let mut count_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(namespace.to_string())];
+
+        let use_join = parent_id.is_some();
+        if let Some(ref pid) = parent_id {
+            count_params.push(Box::new(pid.clone()));
+            conditions.push(format!("r.parent_id = ?{}", count_params.len()));
+        }
+        if let Some(status) = status_filter {
+            count_params.push(Box::new(status.to_string()));
+            conditions.push(format!("a.status = ?{}", count_params.len()));
+        }
+        if let Some(role) = role_filter {
+            count_params.push(Box::new(role.to_string()));
+            conditions.push(format!("a.agent_type = ?{}", count_params.len()));
+        }
+
+        let join_clause = if use_join {
+            "JOIN relationships r ON r.child_id = a.id AND r.namespace = a.namespace"
+        } else {
+            ""
+        };
+
+        let where_clause = conditions.join(" AND ");
+
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM agents a {} WHERE {}",
+            join_clause, where_clause
+        );
+        let total: i64 = self.conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(count_params.iter().map(|p| p.as_ref())),
+            |row| row.get(0),
+        )?;
+
+        let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(namespace.to_string())];
+        if let Some(ref pid) = parent_id {
+            query_params.push(Box::new(pid.clone()));
+        }
+        if let Some(status) = status_filter {
+            query_params.push(Box::new(status.to_string()));
+        }
+        if let Some(role) = role_filter {
+            query_params.push(Box::new(role.to_string()));
+        }
+        query_params.push(Box::new(limit));
+        let limit_idx = query_params.len();
+        query_params.push(Box::new(offset));
+        let offset_idx = query_params.len();
+
+        let select_sql = format!(
+            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.room, a.last_seen_at, a.metadata_json, a.created_at, a.updated_at
+             FROM agents a {} WHERE {} ORDER BY a.name LIMIT ?{} OFFSET ?{}",
+            join_clause, where_clause, limit_idx, offset_idx
+        );
+
+        let mut stmt = self.conn.prepare(&select_sql)?;
+        let agents = stmt
+            .query_map(
+                rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())),
+                |row| {
+                    Ok(Agent {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_type: row.get(2)?,
+                        parent_agent_id: row.get(3)?,
+                        namespace: row.get(4)?,
+                        status: row.get(5)?,
+                        room: row.get(6)?,
+                        last_seen_at: row.get(7)?,
+                        metadata_json: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(AgentListResult { agents, total })
+    }
+
     pub fn resolve_agent_id(&self, prefix: &str, namespace: &str) -> Result<String> {
         let mut stmt = self
             .conn
@@ -822,6 +926,90 @@ impl Database {
         }
 
         Ok(TreeNode { agent, children })
+    }
+
+    pub fn bulk_deregister(&self, namespace: &str, cascade: bool) -> Result<(i64, i64)> {
+        if cascade {
+            let artifacts_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE namespace = ?1",
+                params![namespace],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM artifacts WHERE namespace = ?1",
+                params![namespace],
+            )?;
+            self.conn.execute(
+                "DELETE FROM relationships WHERE namespace = ?1",
+                params![namespace],
+            )?;
+            let agents_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM agents WHERE namespace = ?1",
+                params![namespace],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM agents WHERE namespace = ?1",
+                params![namespace],
+            )?;
+            Ok((agents_count, artifacts_count))
+        } else {
+            let agents_count = self.conn.execute(
+                "DELETE FROM agents WHERE namespace = ?1 AND id NOT IN (SELECT parent_id FROM relationships WHERE namespace = ?1)",
+                params![namespace],
+            )? as i64;
+            Ok((agents_count, 0))
+        }
+    }
+
+    pub fn agent_heartbeat(&self, id: &str, namespace: &str) -> Result<Agent> {
+        let full_id = self.resolve_agent_id(id, namespace)?;
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        self.conn.execute(
+            "UPDATE agents SET last_seen_at = ?1, updated_at = ?1 WHERE id = ?2 AND namespace = ?3",
+            params![now, full_id, namespace],
+        )?;
+
+        self.get_agent_by_id(&full_id)
+    }
+
+    pub fn list_stale_agents(
+        &self,
+        namespace: &str,
+        threshold_minutes: i64,
+    ) -> Result<AgentListResult> {
+        let threshold_str = format!("-{threshold_minutes} minutes");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
+             FROM agents
+             WHERE namespace = ?1
+               AND status = 'running'
+               AND (last_seen_at IS NULL OR last_seen_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+             ORDER BY name",
+        )?;
+
+        let agents = stmt
+            .query_map(params![namespace, threshold_str], |row| {
+                Ok(Agent {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    agent_type: row.get(2)?,
+                    parent_agent_id: row.get(3)?,
+                    namespace: row.get(4)?,
+                    status: row.get(5)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        let total = agents.len() as i64;
+        Ok(AgentListResult { agents, total })
     }
 }
 

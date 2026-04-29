@@ -116,9 +116,35 @@ enum Commands {
         #[command(subcommand)]
         command: ArtifactCommands,
     },
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        #[arg(long, default_value_t = 0)]
+        offset: i64,
+    },
     Serve {
         #[arg(long, default_value = "stdio")]
         transport: String,
+    },
+    BulkDeregister {
+        #[arg(long)]
+        org_id: String,
+        #[arg(long)]
+        cascade: bool,
+    },
+    Heartbeat {
+        #[arg(long)]
+        id: String,
+    },
+    Stale {
+        #[arg(long, default_value_t = 30)]
+        threshold: i64,
     },
 }
 
@@ -490,6 +516,47 @@ fn main() {
                 }
             }
         },
+        Commands::List {
+            status,
+            parent,
+            role,
+            limit,
+            offset,
+        } => {
+            let result = db
+                .list_agents(
+                    namespace,
+                    status.as_deref(),
+                    parent.as_deref(),
+                    role.as_deref(),
+                    limit,
+                    offset,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to list agents: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.agents.is_empty() {
+                println!("No agents found.");
+            } else {
+                println!(
+                    "{:<20} {:<16} {:<10} {:<20} {:<20} {:<20}",
+                    "NAME", "ROLE", "STATUS", "PARENT", "ROOM", "REGISTERED"
+                );
+                println!("{}", "-".repeat(106));
+                for a in &result.agents {
+                    let parent_name = a.parent_agent_id.as_deref().unwrap_or("-");
+                    let room = a.room.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<20} {:<16} {:<10} {:<20} {:<20} {:<20}",
+                        a.name, a.agent_type, a.status, parent_name, room, a.created_at
+                    );
+                }
+                println!("\n{} agent(s) total", result.total);
+            }
+        }
         Commands::Serve { transport } => {
             if transport != "stdio" {
                 eprintln!("Only stdio transport is supported");
@@ -508,6 +575,65 @@ fn main() {
                 let service = server.serve(transport).await.unwrap();
                 service.waiting().await.unwrap();
             });
+        }
+        Commands::BulkDeregister { org_id, cascade } => {
+            let (agents_count, artifacts_count) =
+                db.bulk_deregister(&org_id, cascade).unwrap_or_else(|e| {
+                    eprintln!("Failed to bulk deregister: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "agents_deregistered": agents_count,
+                        "artifacts_deregistered": artifacts_count
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "Bulk deregistered {agents_count} agent(s) and {artifacts_count} artifact(s) from namespace '{org_id}'."
+                );
+            }
+        }
+        Commands::Heartbeat { id } => {
+            let agent = db.agent_heartbeat(&id, namespace).unwrap_or_else(|e| {
+                eprintln!("Failed to heartbeat agent: {e}");
+                std::process::exit(1);
+            });
+            if json {
+                println!("{}", serde_json::to_string(&agent).unwrap());
+            } else {
+                println!("{agent}");
+            }
+        }
+        Commands::Stale { threshold } => {
+            let result = db
+                .list_stale_agents(namespace, threshold)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to list stale agents: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.agents.is_empty() {
+                println!("No stale agents found.");
+            } else {
+                println!(
+                    "{:<38} {:<20} {:<12} {:<24}",
+                    "ID", "NAME", "TYPE", "LAST SEEN"
+                );
+                println!("{}", "-".repeat(94));
+                for a in &result.agents {
+                    let last_seen = a.last_seen_at.as_deref().unwrap_or("never");
+                    println!(
+                        "{:<38} {:<20} {:<12} {:<24}",
+                        a.id, a.name, a.agent_type, last_seen
+                    );
+                }
+                println!("\n{} stale agent(s)", result.total);
+            }
         }
     }
 }

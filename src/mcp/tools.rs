@@ -90,8 +90,36 @@ pub struct DeregisterArtifactParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListAgentsParams {
+    pub namespace: Option<String>,
+    pub status: Option<String>,
+    pub parent: Option<String>,
+    pub role: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchDirectoryParams {
     pub query: String,
     pub namespace: Option<String>,
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BulkDeregisterParams {
+    pub org_id: String,
+    pub cascade: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AgentHeartbeatParams {
+    pub agent_id: String,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListStaleAgentsParams {
+    pub threshold_minutes: Option<i64>,
+    pub namespace: Option<String>,
 }
