@@ -59,7 +59,7 @@ impl OrgMcpServer {
         let actor = self.resolve_actor(params.actor);
 
         let db = self.db.lock().unwrap();
-        let agent = db
+        let result = db
             .register_agent(
                 &params.name,
                 &params.agent_type,
@@ -72,8 +72,14 @@ impl OrgMcpServer {
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let action = if result.created { "created" } else { "updated" };
+        let mut val = serde_json::to_value(&result.agent).unwrap();
+        val.as_object_mut()
+            .unwrap()
+            .insert("action".to_string(), serde_json::json!(action));
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&agent).unwrap(),
+            serde_json::to_string(&val).unwrap(),
         )]))
     }
 
@@ -82,16 +88,40 @@ impl OrgMcpServer {
         &self,
         Parameters(params): Parameters<DeregisterAgentParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        use crate::models::DeregisterResult;
+
         let ns = self.resolve_namespace(&params.namespace);
         let actor = self.resolve_actor(params.actor);
+        let cascade = params.cascade.unwrap_or(false);
 
         let db = self.db.lock().unwrap();
-        db.deregister_agent(&params.id, ns, actor.as_deref())
+        let result = db
+            .deregister_agent(&params.id, ns, actor.as_deref(), cascade)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&serde_json::json!({"deregistered": params.id})).unwrap(),
-        )]))
+        match result {
+            DeregisterResult::HasChildren(children) => {
+                let child_list: Vec<_> = children
+                    .iter()
+                    .map(|c| serde_json::json!({"id": c.id, "name": c.name}))
+                    .collect();
+                Err(ErrorData::invalid_params(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "has_children",
+                        "children": child_list
+                    }))
+                    .unwrap(),
+                    None,
+                ))
+            }
+            DeregisterResult::Cascaded(count) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({"deregistered": count, "cascade": true}))
+                    .unwrap(),
+            )])),
+            DeregisterResult::Deleted => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&serde_json::json!({"deregistered": params.id})).unwrap(),
+            )])),
+        }
     }
 
     #[tool(

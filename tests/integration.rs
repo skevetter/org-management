@@ -27,6 +27,7 @@ fn test_register_agent_text() {
         .args(["register", "--name", "alice", "--type", "engineer"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("CREATED alice"))
         .stdout(predicate::str::contains("Name:      alice"))
         .stdout(predicate::str::contains("Type:      engineer"));
 }
@@ -54,6 +55,7 @@ fn test_register_upsert() {
         .args(["register", "--name", "carol", "--type", "manager"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("UPDATED carol"))
         .stdout(predicate::str::contains("Type:      manager"));
 }
 
@@ -831,21 +833,12 @@ fn test_cascade_delete_relationships() {
         ])
         .output()
         .unwrap();
-    let child: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let child_id = child["id"].as_str().unwrap();
+    let _child: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
     cmd(&db)
-        .args(["deregister", "--id", parent_id])
+        .args(["deregister", "--id", parent_id, "--cascade"])
         .assert()
         .success();
-
-    // Child still exists but has no ancestors
-    let output = cmd(&db)
-        .args(["--json", "ancestors", "--id", child_id])
-        .output()
-        .unwrap();
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["ancestors"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -1311,4 +1304,268 @@ fn test_lookup_shows_room() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"room\":\"ops-room\""));
+}
+
+#[test]
+fn test_deregister_rejects_with_children() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "parent-reject",
+            "--type",
+            "director",
+        ])
+        .output()
+        .unwrap();
+    let parent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parent_id = parent["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "child-reject",
+            "--type",
+            "engineer",
+            "--parent",
+            parent_id,
+        ])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["deregister", "--id", parent_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has 1 children"));
+}
+
+#[test]
+fn test_deregister_cascade() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "casc-root",
+            "--type",
+            "director",
+        ])
+        .output()
+        .unwrap();
+    let root: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root_id = root["id"].as_str().unwrap();
+
+    let output = cmd(&db)
+        .args([
+            "--json", "register", "--name", "casc-mid", "--type", "manager", "--parent", root_id,
+        ])
+        .output()
+        .unwrap();
+    let mid: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mid_id = mid["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "casc-leaf",
+            "--type",
+            "engineer",
+            "--parent",
+            mid_id,
+        ])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["deregister", "--id", root_id, "--cascade"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deregistered 3 agents (cascade)."));
+
+    cmd(&db)
+        .args(["lookup", "--name", "casc-root"])
+        .assert()
+        .failure();
+    cmd(&db)
+        .args(["lookup", "--name", "casc-mid"])
+        .assert()
+        .failure();
+    cmd(&db)
+        .args(["lookup", "--name", "casc-leaf"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_deregister_cascade_json() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json", "register", "--name", "cj-root", "--type", "director",
+        ])
+        .output()
+        .unwrap();
+    let root: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root_id = root["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args([
+            "register", "--name", "cj-child", "--type", "engineer", "--parent", root_id,
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(&db)
+        .args(["--json", "deregister", "--id", root_id, "--cascade"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["deregistered"].as_i64().unwrap(), 2);
+    assert_eq!(result["cascade"].as_bool().unwrap(), true);
+}
+
+#[test]
+fn test_deregister_no_children_succeeds() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "lone-agent",
+            "--type",
+            "engineer",
+        ])
+        .output()
+        .unwrap();
+    let agent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = agent["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args(["deregister", "--id", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deregistered"));
+}
+
+#[test]
+fn test_register_shows_created() {
+    let (_dir, db) = setup();
+    cmd(&db)
+        .args(["register", "--name", "fresh-agent", "--type", "engineer"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CREATED fresh-agent"));
+}
+
+#[test]
+fn test_register_shows_updated() {
+    let (_dir, db) = setup();
+    cmd(&db)
+        .args(["register", "--name", "dup-agent", "--type", "engineer"])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["register", "--name", "dup-agent", "--type", "manager"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("UPDATED dup-agent"));
+}
+
+#[test]
+fn test_register_json_action_field() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "action-test",
+            "--type",
+            "engineer",
+        ])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["action"].as_str().unwrap(), "created");
+
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "action-test",
+            "--type",
+            "manager",
+        ])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["action"].as_str().unwrap(), "updated");
+}
+
+#[test]
+fn test_deregister_cascade_deletes_artifacts() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "art-parent",
+            "--type",
+            "director",
+        ])
+        .output()
+        .unwrap();
+    let parent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parent_id = parent["id"].as_str().unwrap();
+
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "art-child",
+            "--type",
+            "engineer",
+            "--parent",
+            parent_id,
+        ])
+        .output()
+        .unwrap();
+    let child: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let child_id = child["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args([
+            "artifact",
+            "register",
+            "--agent-id",
+            child_id,
+            "--type",
+            "worktree",
+            "--name",
+            "child-wt",
+        ])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["--json", "deregister", "--id", parent_id, "--cascade"])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["lookup", "--name", "art-child"])
+        .assert()
+        .failure();
 }

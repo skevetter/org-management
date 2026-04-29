@@ -17,6 +17,7 @@ pub struct DeregisterAgentParams {
     pub id: String,
     pub namespace: Option<String>,
     pub actor: Option<String>,
+    pub cascade: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

@@ -2,7 +2,10 @@ use chrono::Utc;
 use rusqlite::{Connection, Result, params};
 use uuid::Uuid;
 
-use crate::models::{Agent, AgentListResult, Artifact, ArtifactListResult, TreeNode};
+use crate::models::{
+    Agent, AgentListResult, Artifact, ArtifactListResult, ChildInfo, DeregisterResult,
+    RegisterResult, TreeNode,
+};
 
 pub struct Database {
     conn: Connection,
@@ -142,7 +145,13 @@ impl Database {
         _actor: Option<&str>,
         status: Option<&str>,
         room: Option<&str>,
-    ) -> Result<Agent> {
+    ) -> Result<RegisterResult> {
+        let already_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE name = ?1 AND namespace = ?2",
+            params![name, namespace],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let status = status.unwrap_or("running");
@@ -173,16 +182,94 @@ impl Database {
             )?;
         }
 
-        self.get_agent_by_name(name, namespace)
+        let agent = self.get_agent_by_name(name, namespace)?;
+        Ok(RegisterResult {
+            agent,
+            created: !already_exists,
+        })
     }
 
-    pub fn deregister_agent(&self, id: &str, namespace: &str, _actor: Option<&str>) -> Result<()> {
+    pub fn deregister_agent(
+        &self,
+        id: &str,
+        namespace: &str,
+        _actor: Option<&str>,
+        cascade: bool,
+    ) -> Result<DeregisterResult> {
         let full_id = self.resolve_agent_id(id, namespace)?;
+
+        let children = self.get_children_info(&full_id, namespace)?;
+
+        if !children.is_empty() && !cascade {
+            return Ok(DeregisterResult::HasChildren(children));
+        }
+
+        if cascade && !children.is_empty() {
+            let count = self.cascade_delete(&full_id, namespace)?;
+            return Ok(DeregisterResult::Cascaded(count));
+        }
+
         self.conn.execute(
             "DELETE FROM agents WHERE id = ?1 AND namespace = ?2",
             params![full_id, namespace],
         )?;
+        Ok(DeregisterResult::Deleted)
+    }
+
+    fn get_children_info(&self, parent_id: &str, namespace: &str) -> Result<Vec<ChildInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.name FROM relationships r
+             JOIN agents a ON a.id = r.child_id
+             WHERE r.parent_id = ?1 AND r.namespace = ?2",
+        )?;
+        let children = stmt
+            .query_map(params![parent_id, namespace], |row| {
+                Ok(ChildInfo {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(children)
+    }
+
+    fn collect_descendants(
+        &self,
+        id: &str,
+        namespace: &str,
+        result: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT child_id FROM relationships WHERE parent_id = ?1 AND namespace = ?2",
+        )?;
+        let child_ids: Vec<String> = stmt
+            .query_map(params![id, namespace], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+
+        for child_id in child_ids {
+            self.collect_descendants(&child_id, namespace, result)?;
+            result.push(child_id);
+        }
         Ok(())
+    }
+
+    fn cascade_delete(&self, id: &str, namespace: &str) -> Result<i64> {
+        let mut to_delete = Vec::new();
+        self.collect_descendants(id, namespace, &mut to_delete)?;
+        to_delete.push(id.to_string());
+
+        let count = to_delete.len() as i64;
+        for agent_id in &to_delete {
+            self.conn.execute(
+                "DELETE FROM artifacts WHERE agent_id = ?1 AND namespace = ?2",
+                params![agent_id, namespace],
+            )?;
+            self.conn.execute(
+                "DELETE FROM agents WHERE id = ?1 AND namespace = ?2",
+                params![agent_id, namespace],
+            )?;
+        }
+        Ok(count)
     }
 
     pub fn update_agent_status(&self, id: &str, status: &str, namespace: &str) -> Result<Agent> {

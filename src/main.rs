@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use db::Database;
 use mcp::server::OrgMcpServer;
-use models::{AgentStatus, AgentType, ArtifactStatus, ArtifactType, TreeNode};
+use models::{AgentStatus, AgentType, ArtifactStatus, ArtifactType, DeregisterResult, TreeNode};
 
 fn default_db_path() -> PathBuf {
     let base = match std::env::var("XDG_DATA_HOME") {
@@ -77,6 +77,8 @@ enum Commands {
     Deregister {
         #[arg(long)]
         id: String,
+        #[arg(long)]
+        cascade: bool,
         #[arg(long)]
         actor: Option<String>,
     },
@@ -206,7 +208,7 @@ fn main() {
         } => {
             let actor = get_actor(actor.as_deref());
             let status_str = status.map(|s| s.to_string());
-            let agent = db
+            let result = db
                 .register_agent(
                     &name,
                     &agent_type.to_string(),
@@ -221,26 +223,75 @@ fn main() {
                     eprintln!("Failed to register agent: {e}");
                     std::process::exit(1);
                 });
+            let action = if result.created { "created" } else { "updated" };
             if json {
-                println!("{}", serde_json::to_string(&agent).unwrap());
+                let mut val = serde_json::to_value(&result.agent).unwrap();
+                val.as_object_mut()
+                    .unwrap()
+                    .insert("action".to_string(), serde_json::json!(action));
+                println!("{}", serde_json::to_string(&val).unwrap());
             } else {
-                println!("{agent}");
+                let label = if result.created { "CREATED" } else { "UPDATED" };
+                println!("{label} {}", result.agent.name);
+                println!("{}", result.agent);
             }
         }
-        Commands::Deregister { id, actor } => {
+        Commands::Deregister { id, cascade, actor } => {
             let actor = get_actor(actor.as_deref());
-            db.deregister_agent(&id, namespace, actor.as_deref())
+            let result = db
+                .deregister_agent(&id, namespace, actor.as_deref(), cascade)
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to deregister agent: {e}");
                     std::process::exit(1);
                 });
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({"deregistered": id})).unwrap()
-                );
-            } else {
-                println!("Agent {id} deregistered.");
+            match result {
+                DeregisterResult::HasChildren(children) => {
+                    if json {
+                        let child_list: Vec<_> = children
+                            .iter()
+                            .map(|c| serde_json::json!({"id": c.id, "name": c.name}))
+                            .collect();
+                        eprintln!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "error": "has_children",
+                                "children": child_list
+                            }))
+                            .unwrap()
+                        );
+                    } else {
+                        eprintln!(
+                            "Cannot deregister {}: has {} children. Use --cascade to delete subtree.",
+                            id,
+                            children.len()
+                        );
+                    }
+                    std::process::exit(1);
+                }
+                DeregisterResult::Cascaded(count) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(
+                                &serde_json::json!({"deregistered": count, "cascade": true})
+                            )
+                            .unwrap()
+                        );
+                    } else {
+                        println!("Deregistered {count} agents (cascade).");
+                    }
+                }
+                DeregisterResult::Deleted => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({"deregistered": id}))
+                                .unwrap()
+                        );
+                    } else {
+                        println!("Agent {id} deregistered.");
+                    }
+                }
             }
         }
         Commands::Lookup { id, name } => {

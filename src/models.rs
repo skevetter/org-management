@@ -224,6 +224,25 @@ impl fmt::Display for Artifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResult {
+    pub agent: Agent,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeregisterResult {
+    Deleted,
+    Cascaded(i64),
+    HasChildren(Vec<ChildInfo>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentListResult {
     pub agents: Vec<Agent>,
     pub total: i64,
