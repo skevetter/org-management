@@ -67,6 +67,8 @@ impl OrgMcpServer {
                 ns,
                 params.metadata.as_deref(),
                 actor.as_deref(),
+                params.status.as_deref(),
+                params.room.as_deref(),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -89,6 +91,25 @@ impl OrgMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string(&serde_json::json!({"deregistered": params.id})).unwrap(),
+        )]))
+    }
+
+    #[tool(
+        description = "Update an agent's status (active, inactive, archived, running, idle, blocked, done)"
+    )]
+    fn update_agent_status(
+        &self,
+        Parameters(params): Parameters<UpdateAgentStatusParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let agent = db
+            .update_agent_status(&params.agent_id, &params.status, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&agent).unwrap(),
         )]))
     }
 
@@ -128,7 +149,7 @@ impl OrgMcpServer {
 
         let db = self.db.lock().unwrap();
         let result = db
-            .list_children(&params.id, ns, limit, offset)
+            .list_children(&params.id, ns, limit, offset, params.status.as_deref())
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(

@@ -8,6 +8,30 @@ pub struct Database {
     conn: Connection,
 }
 
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    let mut has_room = false;
+    let mut has_last_seen_at = false;
+
+    let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in rows {
+        match col?.as_str() {
+            "room" => has_room = true,
+            "last_seen_at" => has_last_seen_at = true,
+            _ => {}
+        }
+    }
+
+    if !has_room {
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN room TEXT")?;
+    }
+    if !has_last_seen_at {
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN last_seen_at TEXT")?;
+    }
+
+    Ok(())
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -27,6 +51,8 @@ impl Database {
                  parent_agent_id TEXT,
                  namespace       TEXT NOT NULL DEFAULT 'default',
                  status          TEXT NOT NULL DEFAULT 'active',
+                 room            TEXT,
+                 last_seen_at    TEXT,
                  metadata_json   TEXT,
                  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -100,9 +126,12 @@ impl Database {
              END;",
         )?;
 
+        migrate_v1_to_v2(&conn)?;
+
         Ok(Self { conn })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register_agent(
         &self,
         name: &str,
@@ -111,20 +140,24 @@ impl Database {
         namespace: &str,
         metadata: Option<&str>,
         _actor: Option<&str>,
+        status: Option<&str>,
+        room: Option<&str>,
     ) -> Result<Agent> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let status = status.unwrap_or("running");
 
         self.conn.execute(
-            "INSERT INTO agents (id, name, agent_type, parent_agent_id, namespace, metadata_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO agents (id, name, agent_type, parent_agent_id, namespace, status, room, metadata_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(name, namespace) DO UPDATE SET
                  agent_type = excluded.agent_type,
                  parent_agent_id = excluded.parent_agent_id,
                  metadata_json = excluded.metadata_json,
-                 status = 'active',
+                 status = excluded.status,
+                 room = excluded.room,
                  updated_at = excluded.updated_at",
-            params![id, name, agent_type, parent_id, namespace, metadata, now, now],
+            params![id, name, agent_type, parent_id, namespace, status, room, metadata, now, now],
         )?;
 
         if let Some(pid) = parent_id {
@@ -152,6 +185,18 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_agent_status(&self, id: &str, status: &str, namespace: &str) -> Result<Agent> {
+        let full_id = self.resolve_agent_id(id, namespace)?;
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        self.conn.execute(
+            "UPDATE agents SET status = ?1, last_seen_at = ?2, updated_at = ?2 WHERE id = ?3 AND namespace = ?4",
+            params![status, now, full_id, namespace],
+        )?;
+
+        self.get_agent_by_id(&full_id)
+    }
+
     pub fn lookup_agent(
         &self,
         id: Option<&str>,
@@ -164,7 +209,7 @@ impl Database {
                 Err(_) => return Ok(None),
             };
             let mut stmt = self.conn.prepare(
-                "SELECT id, name, agent_type, parent_agent_id, namespace, status, metadata_json, created_at, updated_at
+                "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
                  FROM agents WHERE id = ?1 AND namespace = ?2",
             )?;
             let result = stmt.query_row(params![full_id, namespace], |row| {
@@ -175,9 +220,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             });
             match result {
@@ -187,7 +234,7 @@ impl Database {
             }
         } else if let Some(name_val) = name {
             let mut stmt = self.conn.prepare(
-                "SELECT id, name, agent_type, parent_agent_id, namespace, status, metadata_json, created_at, updated_at
+                "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
                  FROM agents WHERE name = ?1 AND namespace = ?2",
             )?;
             let result = stmt.query_row(params![name_val, namespace], |row| {
@@ -198,9 +245,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             });
             match result {
@@ -219,41 +268,85 @@ impl Database {
         namespace: &str,
         limit: i64,
         offset: i64,
+        status_filter: Option<&str>,
     ) -> Result<AgentListResult> {
         let full_id = self.resolve_agent_id(parent_id, namespace)?;
 
-        let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM relationships r
-             JOIN agents a ON a.id = r.child_id
-             WHERE r.parent_id = ?1 AND r.namespace = ?2",
-            params![full_id, namespace],
-            |row| row.get(0),
-        )?;
+        let (total, agents) = if let Some(status) = status_filter {
+            let total: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM relationships r
+                 JOIN agents a ON a.id = r.child_id
+                 WHERE r.parent_id = ?1 AND r.namespace = ?2 AND a.status = ?3",
+                params![full_id, namespace, status],
+                |row| row.get(0),
+            )?;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.metadata_json, a.created_at, a.updated_at
-             FROM relationships r
-             JOIN agents a ON a.id = r.child_id
-             WHERE r.parent_id = ?1 AND r.namespace = ?2
-             ORDER BY a.name
-             LIMIT ?3 OFFSET ?4",
-        )?;
+            let mut stmt = self.conn.prepare(
+                "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.room, a.last_seen_at, a.metadata_json, a.created_at, a.updated_at
+                 FROM relationships r
+                 JOIN agents a ON a.id = r.child_id
+                 WHERE r.parent_id = ?1 AND r.namespace = ?2 AND a.status = ?3
+                 ORDER BY a.name
+                 LIMIT ?4 OFFSET ?5",
+            )?;
 
-        let agents = stmt
-            .query_map(params![full_id, namespace, limit, offset], |row| {
-                Ok(Agent {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    parent_agent_id: row.get(3)?,
-                    namespace: row.get(4)?,
-                    status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
+            let agents = stmt
+                .query_map(params![full_id, namespace, status, limit, offset], |row| {
+                    Ok(Agent {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_type: row.get(2)?,
+                        parent_agent_id: row.get(3)?,
+                        namespace: row.get(4)?,
+                        status: row.get(5)?,
+                        room: row.get(6)?,
+                        last_seen_at: row.get(7)?,
+                        metadata_json: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>>>()?;
+
+            (total, agents)
+        } else {
+            let total: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM relationships r
+                 JOIN agents a ON a.id = r.child_id
+                 WHERE r.parent_id = ?1 AND r.namespace = ?2",
+                params![full_id, namespace],
+                |row| row.get(0),
+            )?;
+
+            let mut stmt = self.conn.prepare(
+                "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.room, a.last_seen_at, a.metadata_json, a.created_at, a.updated_at
+                 FROM relationships r
+                 JOIN agents a ON a.id = r.child_id
+                 WHERE r.parent_id = ?1 AND r.namespace = ?2
+                 ORDER BY a.name
+                 LIMIT ?3 OFFSET ?4",
+            )?;
+
+            let agents = stmt
+                .query_map(params![full_id, namespace, limit, offset], |row| {
+                    Ok(Agent {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_type: row.get(2)?,
+                        parent_agent_id: row.get(3)?,
+                        namespace: row.get(4)?,
+                        status: row.get(5)?,
+                        room: row.get(6)?,
+                        last_seen_at: row.get(7)?,
+                        metadata_json: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>>>()?;
+
+            (total, agents)
+        };
 
         Ok(AgentListResult { agents, total })
     }
@@ -293,7 +386,7 @@ impl Database {
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, name, agent_type, parent_agent_id, namespace, status, metadata_json, created_at, updated_at
+                    "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
                      FROM agents
                      WHERE namespace = ?1
                      AND id NOT IN (SELECT child_id FROM relationships WHERE namespace = ?1)
@@ -308,9 +401,11 @@ impl Database {
                             parent_agent_id: row.get(3)?,
                             namespace: row.get(4)?,
                             status: row.get(5)?,
-                            metadata_json: row.get(6)?,
-                            created_at: row.get(7)?,
-                            updated_at: row.get(8)?,
+                            room: row.get(6)?,
+                            last_seen_at: row.get(7)?,
+                            metadata_json: row.get(8)?,
+                            created_at: row.get(9)?,
+                            updated_at: row.get(10)?,
                         })
                     })?
                     .collect::<Result<Vec<_>>>()?;
@@ -437,7 +532,7 @@ impl Database {
         limit: i64,
     ) -> Result<AgentListResult> {
         let mut stmt = self.conn.prepare(
-            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.metadata_json, a.created_at, a.updated_at
+            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.room, a.last_seen_at, a.metadata_json, a.created_at, a.updated_at
              FROM agents_fts f
              JOIN agents a ON a.rowid = f.rowid
              WHERE agents_fts MATCH ?1 AND a.namespace = ?2
@@ -453,9 +548,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -510,7 +607,7 @@ impl Database {
 
     fn get_agent_by_name(&self, name: &str, namespace: &str) -> Result<Agent> {
         self.conn.query_row(
-            "SELECT id, name, agent_type, parent_agent_id, namespace, status, metadata_json, created_at, updated_at
+            "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
              FROM agents WHERE name = ?1 AND namespace = ?2",
             params![name, namespace],
             |row| {
@@ -521,9 +618,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         )
@@ -531,7 +630,7 @@ impl Database {
 
     fn get_agent_by_id(&self, id: &str) -> Result<Agent> {
         self.conn.query_row(
-            "SELECT id, name, agent_type, parent_agent_id, namespace, status, metadata_json, created_at, updated_at
+            "SELECT id, name, agent_type, parent_agent_id, namespace, status, room, last_seen_at, metadata_json, created_at, updated_at
              FROM agents WHERE id = ?1",
             params![id],
             |row| {
@@ -542,9 +641,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         )
@@ -603,7 +704,7 @@ impl Database {
 
     fn build_tree_node(&self, agent: Agent, namespace: &str) -> Result<TreeNode> {
         let mut stmt = self.conn.prepare(
-            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.metadata_json, a.created_at, a.updated_at
+            "SELECT a.id, a.name, a.agent_type, a.parent_agent_id, a.namespace, a.status, a.room, a.last_seen_at, a.metadata_json, a.created_at, a.updated_at
              FROM relationships r
              JOIN agents a ON a.id = r.child_id
              WHERE r.parent_id = ?1 AND r.namespace = ?2
@@ -619,9 +720,11 @@ impl Database {
                     parent_agent_id: row.get(3)?,
                     namespace: row.get(4)?,
                     status: row.get(5)?,
-                    metadata_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    room: row.get(6)?,
+                    last_seen_at: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;

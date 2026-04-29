@@ -903,7 +903,7 @@ fn test_default_namespace() {
 }
 
 #[test]
-fn test_agent_status_active_on_register() {
+fn test_agent_status_running_on_register() {
     let (_dir, db) = setup();
     let output = cmd(&db)
         .args([
@@ -917,7 +917,7 @@ fn test_agent_status_active_on_register() {
         .output()
         .unwrap();
     let agent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(agent["status"].as_str().unwrap(), "active");
+    assert_eq!(agent["status"].as_str().unwrap(), "running");
 }
 
 #[test]
@@ -1134,4 +1134,181 @@ fn test_actor_env_var() {
         ])
         .assert()
         .success();
+}
+
+#[test]
+fn test_register_with_status() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "status-agent",
+            "--type",
+            "engineer",
+            "--status",
+            "running",
+        ])
+        .output()
+        .unwrap();
+    let agent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(agent["status"].as_str().unwrap(), "running");
+}
+
+#[test]
+fn test_register_with_room() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "room-agent",
+            "--type",
+            "engineer",
+            "--room",
+            "my-room",
+        ])
+        .output()
+        .unwrap();
+    let agent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(agent["room"].as_str().unwrap(), "my-room");
+}
+
+#[test]
+fn test_update_status() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "updatable",
+            "--type",
+            "engineer",
+        ])
+        .output()
+        .unwrap();
+    let agent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = agent["id"].as_str().unwrap();
+
+    let output = cmd(&db)
+        .args(["--json", "update-status", "--id", id, "--status", "idle"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let updated: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(updated["status"].as_str().unwrap(), "idle");
+}
+
+#[test]
+fn test_update_status_invalid() {
+    let (_dir, db) = setup();
+    cmd(&db)
+        .args(["register", "--name", "inv-status", "--type", "engineer"])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["update-status", "--id", "anything", "--status", "bogus"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_list_children_status_filter() {
+    let (_dir, db) = setup();
+    let output = cmd(&db)
+        .args([
+            "--json",
+            "register",
+            "--name",
+            "filter-parent",
+            "--type",
+            "manager",
+        ])
+        .output()
+        .unwrap();
+    let parent: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parent_id = parent["id"].as_str().unwrap();
+
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "child-running",
+            "--type",
+            "engineer",
+            "--parent",
+            parent_id,
+            "--status",
+            "running",
+        ])
+        .assert()
+        .success();
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "child-idle",
+            "--type",
+            "engineer",
+            "--parent",
+            parent_id,
+            "--status",
+            "idle",
+        ])
+        .assert()
+        .success();
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "child-blocked",
+            "--type",
+            "engineer",
+            "--parent",
+            parent_id,
+            "--status",
+            "blocked",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(&db)
+        .args([
+            "--json", "children", "--id", parent_id, "--status", "running",
+        ])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["total"].as_i64().unwrap(), 1);
+    assert_eq!(
+        result["agents"][0]["name"].as_str().unwrap(),
+        "child-running"
+    );
+}
+
+#[test]
+fn test_lookup_shows_room() {
+    let (_dir, db) = setup();
+    cmd(&db)
+        .args([
+            "register",
+            "--name",
+            "room-lookup",
+            "--type",
+            "engineer",
+            "--room",
+            "ops-room",
+        ])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["--json", "lookup", "--name", "room-lookup"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"room\":\"ops-room\""));
 }

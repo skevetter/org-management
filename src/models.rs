@@ -48,6 +48,10 @@ pub enum AgentStatus {
     Active,
     Inactive,
     Archived,
+    Running,
+    Idle,
+    Blocked,
+    Done,
 }
 
 impl fmt::Display for AgentStatus {
@@ -56,6 +60,10 @@ impl fmt::Display for AgentStatus {
             Self::Active => write!(f, "active"),
             Self::Inactive => write!(f, "inactive"),
             Self::Archived => write!(f, "archived"),
+            Self::Running => write!(f, "running"),
+            Self::Idle => write!(f, "idle"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::Done => write!(f, "done"),
         }
     }
 }
@@ -68,6 +76,10 @@ impl FromStr for AgentStatus {
             "active" => Ok(Self::Active),
             "inactive" => Ok(Self::Inactive),
             "archived" => Ok(Self::Archived),
+            "running" => Ok(Self::Running),
+            "idle" => Ok(Self::Idle),
+            "blocked" => Ok(Self::Blocked),
+            "done" => Ok(Self::Done),
             _ => Err(format!("unknown agent status: {s}")),
         }
     }
@@ -150,6 +162,8 @@ pub struct Agent {
     pub parent_agent_id: Option<String>,
     pub namespace: String,
     pub status: String,
+    pub room: Option<String>,
+    pub last_seen_at: Option<String>,
     pub metadata_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -165,6 +179,12 @@ impl fmt::Display for Agent {
         }
         writeln!(f, "Namespace: {}", self.namespace)?;
         writeln!(f, "Status:    {}", self.status)?;
+        if let Some(room) = &self.room {
+            writeln!(f, "Room:      {room}")?;
+        }
+        if let Some(last_seen) = &self.last_seen_at {
+            writeln!(f, "Last Seen: {last_seen}")?;
+        }
         if let Some(meta) = &self.metadata_json {
             writeln!(f, "Metadata:  {meta}")?;
         }

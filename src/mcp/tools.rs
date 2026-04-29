@@ -8,6 +8,8 @@ pub struct RegisterAgentParams {
     pub namespace: Option<String>,
     pub metadata: Option<String>,
     pub actor: Option<String>,
+    pub status: Option<String>,
+    pub room: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -30,6 +32,14 @@ pub struct ListChildrenParams {
     pub namespace: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateAgentStatusParams {
+    pub agent_id: String,
+    pub status: String,
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

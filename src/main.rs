@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use db::Database;
 use mcp::server::OrgMcpServer;
-use models::{AgentType, ArtifactStatus, ArtifactType, TreeNode};
+use models::{AgentStatus, AgentType, ArtifactStatus, ArtifactType, TreeNode};
 
 fn default_db_path() -> PathBuf {
     let base = match std::env::var("XDG_DATA_HOME") {
@@ -69,6 +69,10 @@ enum Commands {
         metadata: Option<String>,
         #[arg(long)]
         actor: Option<String>,
+        #[arg(long, value_enum)]
+        status: Option<AgentStatus>,
+        #[arg(long)]
+        room: Option<String>,
     },
     Deregister {
         #[arg(long)]
@@ -89,6 +93,14 @@ enum Commands {
         limit: i64,
         #[arg(long, default_value_t = 0)]
         offset: i64,
+        #[arg(long, value_enum)]
+        status: Option<AgentStatus>,
+    },
+    UpdateStatus {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum)]
+        status: AgentStatus,
     },
     Ancestors {
         #[arg(long)]
@@ -189,8 +201,11 @@ fn main() {
             parent,
             metadata,
             actor,
+            status,
+            room,
         } => {
             let actor = get_actor(actor.as_deref());
+            let status_str = status.map(|s| s.to_string());
             let agent = db
                 .register_agent(
                     &name,
@@ -199,6 +214,8 @@ fn main() {
                     namespace,
                     metadata.as_deref(),
                     actor.as_deref(),
+                    status_str.as_deref(),
+                    room.as_deref(),
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to register agent: {e}");
@@ -251,9 +268,15 @@ fn main() {
                 }
             }
         }
-        Commands::Children { id, limit, offset } => {
+        Commands::Children {
+            id,
+            limit,
+            offset,
+            status,
+        } => {
+            let status_str = status.map(|s| s.to_string());
             let result = db
-                .list_children(&id, namespace, limit, offset)
+                .list_children(&id, namespace, limit, offset, status_str.as_deref())
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to list children: {e}");
                     std::process::exit(1);
@@ -269,6 +292,19 @@ fn main() {
                     println!("{:<38} {:<20} {:<12}", a.id, a.name, a.agent_type);
                 }
                 println!("\n{} agent(s) total", result.total);
+            }
+        }
+        Commands::UpdateStatus { id, status } => {
+            let agent = db
+                .update_agent_status(&id, &status.to_string(), namespace)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to update agent status: {e}");
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&agent).unwrap());
+            } else {
+                println!("{agent}");
             }
         }
         Commands::Ancestors { id } => {
