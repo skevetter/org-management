@@ -1,4 +1,5 @@
 mod db;
+mod mcp;
 mod models;
 
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use db::Database;
+use mcp::server::OrgMcpServer;
 use models::{AgentType, ArtifactStatus, ArtifactType, TreeNode};
 
 fn default_db_path() -> PathBuf {
@@ -406,7 +408,19 @@ fn main() {
                 eprintln!("Only stdio transport is supported");
                 std::process::exit(1);
             }
-            println!("MCP server not yet implemented");
+            let actor = std::env::var("PASEO_AGENT_ID").ok();
+            let ns = cli.namespace;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                use rmcp::ServiceExt;
+                let server = OrgMcpServer::new(db, ns, actor);
+                let transport = rmcp::transport::io::stdio();
+                let service = server.serve(transport).await.unwrap();
+                service.waiting().await.unwrap();
+            });
         }
     }
 }
